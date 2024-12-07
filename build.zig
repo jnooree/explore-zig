@@ -1,40 +1,44 @@
 const std = @import("std");
+const mem = std.mem;
+const fs = std.fs;
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
-pub fn build(b: *std.Build) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+fn concat(allocator: mem.Allocator, comptime T: type, items: anytype) ![]T {
+    var total: usize = 0;
+    inline for (items) |item|
+        total += item.len;
 
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    var result = try allocator.alloc(T, total);
+    var begin: usize = 0;
+    inline for (items) |item| {
+        const end = begin + item.len;
+        @memcpy(result[begin..end], item);
+        begin = end;
+    }
 
-    const lib = b.addStaticLibrary(.{
-        .name = "explore-zig",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    return result;
+}
 
-    // This declares intent for the library to be installed into the standard
-    // location when the user invokes the "install" step (the default step when
-    // running `zig build`).
-    b.installArtifact(lib);
+fn buildOne(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    utils: *std.Build.Module,
+    year: []const u8,
+    subpath: []const u8,
+) !void {
+    const fname = fs.path.stem(subpath);
+
+    const exename = try concat(b.allocator, u8, .{ "aoc-", year, "-", fname });
+    defer b.allocator.free(exename);
 
     const exe = b.addExecutable(.{
-        .name = "explore-zig",
-        .root_source_file = b.path("src/main.zig"),
+        .name = exename,
+        .root_source_file = b.path(subpath),
         .target = target,
         .optimize = optimize,
     });
+
+    exe.root_module.addImport("utils", utils);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -61,31 +65,85 @@ pub fn build(b: *std.Build) void {
     // This creates a build step. It will be visible in the `zig build --help` menu,
     // and can be selected like this: `zig build run`
     // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run", "Run the app");
+
+    const runname = try concat(b.allocator, u8, .{ "run-", fname });
+    defer b.allocator.free(runname);
+
+    const rundesc = try concat(b.allocator, u8, .{ "Run ", fname });
+    defer b.allocator.free(rundesc);
+
+    const run_step = b.step(runname, rundesc);
     run_step.dependOn(&run_cmd.step);
+}
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
-    const lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/root.zig"),
+// Although this function looks imperative, note that its job is to
+// declaratively construct a build graph that will be executed by an external
+// runner.
+pub fn build(b: *std.Build) !void {
+    const year = b.option([]const u8, "year", "The AOC year") orelse "2024";
+    const day = b.option([]const u8, "day", "The AOC day");
+
+    // Standard target options allows the person running `zig build` to choose
+    // what target to build for. Here we do not override the defaults, which
+    // means any target is allowed, and the default is native. Other options
+    // for restricting supported target set are available.
+    const target = b.standardTargetOptions(.{});
+
+    // Standard optimization options allow the person running `zig build` to select
+    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
+    // set a preferred release mode, allowing the user to decide how to optimize.
+    const optimize = b.standardOptimizeOption(.{});
+
+    const utils = b.addModule("utils", .{
+        .root_source_file = b.path("src/utils.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    const subdir = try concat(b.allocator, u8, .{ "src/aoc-", year });
+    defer b.allocator.free(subdir);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    if (day) |d| {
+        const subpath = try concat(b.allocator, u8, .{ subdir, "/day", d, ".zig" });
+        defer b.allocator.free(subpath);
 
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+        try buildOne(b, target, optimize, utils, year, subpath);
+        return;
+    }
 
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
-    test_step.dependOn(&run_exe_unit_tests.step);
+    var walker = try fs.cwd().openDir(subdir, .{ .iterate = true });
+    defer walker.close();
+
+    var it = walker.iterate();
+    while (try it.next()) |ent| {
+        const subpath = try concat(b.allocator, u8, .{ subdir, "/", ent.name });
+        defer b.allocator.free(subpath);
+
+        try buildOne(b, target, optimize, utils, year, subpath);
+    }
+
+    // // Creates a step for unit testing. This only builds the test executable
+    // // but does not run it.
+    // const lib_unit_tests = b.addTest(.{
+    //     .root_source_file = b.path("src/root.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+
+    // const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+
+    // const exe_unit_tests = b.addTest(.{
+    //     .root_source_file = b.path("src/main.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+
+    // const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+
+    // // Similar to creating the run step earlier, this exposes a `test` step to
+    // // the `zig build --help` menu, providing a way for the user to request
+    // // running the unit tests.
+    // const test_step = b.step("test", "Run unit tests");
+    // test_step.dependOn(&run_lib_unit_tests.step);
+    // test_step.dependOn(&run_exe_unit_tests.step);
 }
